@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pose Camera Analytics</title>
+<style>
+  body {
+    margin: 0; background: #111; min-height: 100vh;
+    display: flex; justify-content: center; align-items: center;
+    font-family: system-ui, sans-serif;
+  }
+  #wrap {
+    position: relative; width: 640px; max-width: 100vw;
+    aspect-ratio: 4 / 3; background: #000;
+  }
+  #video, #canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    transform: scaleX(-1);
+  }
+  #stats {
+    position: absolute; top: 8px; left: 8px; z-index: 2;
+    background: rgba(0,0,0,.6); color: #fff; padding: 6px 10px;
+    border-radius: 6px; font-size: 14px; line-height: 1.5;
+    max-width: 90%;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="stats">Starting camera…</div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video  = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx    = canvas.getContext("2d");
+const stats  = document.getElementById("stats");
+
+const SKELETON_COLOR = "#00FFFF"; // cyan
+const KEYPOINT_COLOR = "#00FF00"; // green
+const VIS_THRESHOLD  = 0.5;
+
+const WASM_URL  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const setStatus = (html) => { stats.innerHTML = html; };
+const isVisible = (p) => (p.visibility ?? 1) >= VIS_THRESHOLD;
+
+function drawPose(landmarks, W, H) {
+  ctx.strokeStyle = SKELETON_COLOR;
+  ctx.lineWidth = 3;
+  for (const { start, end } of PoseLandmarker.POSE_CONNECTIONS) {
+    const a = landmarks[start], b = landmarks[end];
+    if (!a || !b || !isVisible(a) || !isVisible(b)) continue;
+    ctx.beginPath();
+    ctx.moveTo(a.x * W, a.y * H);
+    ctx.lineTo(b.x * W, b.y * H);
+    ctx.stroke();
+  }
+  ctx.fillStyle = KEYPOINT_COLOR;
+  for (const p of landmarks) {
+    if (!isVisible(p)) continue;
+    ctx.beginPath();
+    ctx.arc(p.x * W, p.y * H, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+async function main() {
+  try {
+    // 1. Start the camera
+    setStatus("Requesting camera…");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480 }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    const W = video.videoWidth  || 640;
+    const H = video.videoHeight || 480;
+    canvas.width  = W;
+    canvas.height = H;
+
+    // 2. Load the model on the CPU (avoids the WebGL/activeTexture error)
+    setStatus("Loading model… (first load can take a minute)");
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    const landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+      runningMode: "VIDEO",
+      numPoses: 2
+    });
+
+    // 3. Detection loop with analytics
+    let lastVideoTime = -1;
+    let frameCount = 0, fps = 0, fpsWindowStart = performance.now();
+    let totalDetections = 0;
+
+    function loop() {
+      try {
+        if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+
+          const result = landmarker.detectForVideo(video, performance.now());
+          ctx.clearRect(0, 0, W, H);
+
+          const people = result.landmarks.length;
+          let visibleKeypoints = 0;
+          for (const lm of result.landmarks) {
+            drawPose(lm, W, H);
+            visibleKeypoints += lm.filter(isVisible).length;
+          }
+
+          frameCount++;
+          totalDetections += people;
+          const now = performance.now();
+          if (now - fpsWindowStart >= 1000) {
+            fps = Math.round(frameCount * 1000 / (now - fpsWindowStart));
+            frameCount = 0;
+            fpsWindowStart = now;
+          }
+
+          setStatus(
+            `People: ${people}<br>` +
+            `Keypoints: 33 per person (${visibleKeypoints} visible)<br>` +
+            `FPS: ${fps}<br>` +
+            `Total detections: ${totalDetections}`
+          );
+        }
+      } catch (err) {
+        console.error("Detection error:", err);
+        setStatus(`Detection error: ${err.message || err}`);
+        return; // stop the loop on error so the message stays visible
+      }
+      requestAnimationFrame(loop);
+    }
+    loop();
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err.message || err}<br>Press F12 for details.`);
+  }
+}
+
+main();
+</script>
+</body>
+</html>
